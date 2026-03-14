@@ -1,7 +1,10 @@
 """
 Video Analyzer for iPhone (Pyto IDE)
-Analyzes videos offline for content editing: scene changes, motion, faces, audio spikes.
+Analyzes videos for content editing: scene changes, motion, faces, audio spikes.
+Optional AI mode: describe what you want to find and Claude Vision will detect it.
+
 Set your video_path in CONFIG below, then tap Run.
+To use AI mode: set your api_key and describe what to find in ai_prompt.
 """
 
 import cv2
@@ -11,6 +14,9 @@ import os
 import time
 import wave
 import struct
+import base64
+import urllib.request
+import urllib.error
 
 # ============================================================================
 # CONFIGURATION — Edit these values before running
@@ -21,6 +27,13 @@ CONFIG = {
     "video_path": "/path/to/your/video.mov",   # SET THIS to your video file path
     "audio_path": "",                           # Optional: path to WAV file for audio analysis
     "output_path": "",                          # Optional: path for JSON output (empty = console only)
+
+    # --- AI-Powered Detection (requires internet) ---
+    "ai_enabled": False,        # Set to True to enable prompt-based AI detection
+    "api_key": "",              # Your Anthropic API key (starts with "sk-ant-")
+    "ai_prompt": "",            # Describe what to find, e.g. "someone raising their hand"
+    "ai_frame_interval": 30,    # Check every Nth analyzed frame with AI (controls API cost)
+    "ai_resize_width": 512,     # Resize frames sent to API (smaller = faster + cheaper)
 
     # --- Performance ---
     "frame_skip": 5,            # Analyze every Nth frame (higher = faster, less precise)
@@ -323,6 +336,136 @@ class AudioSpikeDetector:
 
 
 # ============================================================================
+# AI PROMPT DETECTOR (Claude Vision API)
+# ============================================================================
+
+class PromptDetector:
+    """Sends sampled frames to Claude Vision to detect user-described events."""
+
+    API_URL = "https://api.anthropic.com/v1/messages"
+
+    def __init__(self, config):
+        self.enabled = config.get("ai_enabled", False)
+        self.api_key = config.get("api_key", "")
+        self.prompt = config.get("ai_prompt", "")
+        self.frame_interval = config.get("ai_frame_interval", 30)
+        self.resize_width = config.get("ai_resize_width", 512)
+        self.events = []
+        self._frame_counter = 0
+
+        if self.enabled and not self.api_key:
+            print("WARNING: ai_enabled is True but no api_key provided. AI detection disabled.")
+            self.enabled = False
+        if self.enabled and not self.prompt:
+            print("WARNING: ai_enabled is True but no ai_prompt provided. AI detection disabled.")
+            self.enabled = False
+        if self.enabled:
+            print(f"AI Detection: looking for \"{self.prompt}\"")
+            print(f"  Checking every {self.frame_interval}th analyzed frame via Claude Vision")
+
+    def _frame_to_base64(self, frame):
+        resized = resize_frame(frame, self.resize_width)
+        _, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        return base64.b64encode(buf).decode("utf-8")
+
+    def _call_api(self, image_b64):
+        system_msg = (
+            "You are analyzing a single video frame. The user wants to know if a "
+            "specific thing is happening in this frame. Respond with ONLY a JSON object: "
+            '{"detected": true/false, "confidence": "high"/"medium"/"low", '
+            '"description": "brief description of what you see"}. '
+            "No other text."
+        )
+        user_msg = (
+            f"Is the following happening in this frame: \"{self.prompt}\"?\n"
+            "Look carefully at the image and respond with the JSON format specified."
+        )
+
+        body = json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 150,
+            "system": system_msg,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": user_msg
+                    }
+                ]
+            }]
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            self.API_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01"
+            },
+            method="POST"
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                text = result["content"][0]["text"]
+                # Parse JSON from response
+                text = text.strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                return json.loads(text)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            print(f"  AI API error ({e.code}): {error_body[:200]}")
+            return None
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"  AI API connection error: {e}")
+            return None
+        except (json.JSONDecodeError, KeyError, IndexError):
+            return None
+
+    def process_frame(self, frame, frame_number, fps):
+        if not self.enabled:
+            return
+
+        self._frame_counter += 1
+        if self._frame_counter % self.frame_interval != 0:
+            return
+
+        ts = frame_number / fps
+        image_b64 = self._frame_to_base64(frame)
+        result = self._call_api(image_b64)
+
+        if result and result.get("detected"):
+            confidence = result.get("confidence", "unknown")
+            description = result.get("description", "")
+            self.events.append({
+                "timestamp_sec": ts,
+                "timestamp": format_timestamp(ts),
+                "type": "AI_DETECTED",
+                "details": {
+                    "prompt": self.prompt,
+                    "confidence": confidence,
+                    "description": description
+                }
+            })
+            print(f"  ** AI match at {format_timestamp(ts)}: {description} [{confidence}]")
+
+    def get_events(self):
+        return self.events
+
+
+# ============================================================================
 # MAIN ANALYSIS ENGINE
 # ============================================================================
 
@@ -364,6 +507,7 @@ def analyze_video(config):
     motion_det = MotionDetector(config)
     face_det = FaceDetector(config)
     audio_det = AudioSpikeDetector(config)
+    prompt_det = PromptDetector(config)
 
     # Run audio analysis first (separate pass)
     audio_det.analyze()
@@ -385,6 +529,7 @@ def analyze_video(config):
             scene_det.process_frame(frame, frame_idx, fps)
             motion_det.process_frame(frame, frame_idx, fps)
             face_det.process_frame(frame, frame_idx, fps)
+            prompt_det.process_frame(frame, frame_idx, fps)
 
             analyzed_count += 1
             if analyzed_count % config["progress_interval"] == 0:
@@ -404,6 +549,7 @@ def analyze_video(config):
         + motion_det.get_events()
         + face_det.get_events()
         + audio_det.get_events()
+        + prompt_det.get_events()
     )
     all_events = merge_nearby_events(all_events, config["merge_window_sec"])
 
