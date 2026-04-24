@@ -74,24 +74,35 @@ function Resolve-HostName {
 if (-not $Subnet) { $Subnet = Get-LocalSubnet }
 Write-Host "Scanning subnet $Subnet.0/24 for printers on port 9100..." -ForegroundColor Cyan
 
-$jobs = 1..254 | ForEach-Object {
-    $ip = "$Subnet.$_"
-    Start-ThreadJob -ScriptBlock {
-        param($addr)
-        $c = [System.Net.Sockets.TcpClient]::new()
-        try {
-            $async = $c.BeginConnect($addr, 9100, $null, $null)
-            if ($async.AsyncWaitHandle.WaitOne(400, $false) -and $c.Connected) {
-                $c.EndConnect($async) | Out-Null
-                return $addr
-            }
-        } catch { }
-        finally { $c.Close() }
-        return $null
-    } -ArgumentList $ip
+$scriptBlock = {
+    param($addr, $port, $timeoutMs)
+    $c = New-Object System.Net.Sockets.TcpClient
+    try {
+        $async = $c.BeginConnect($addr, $port, $null, $null)
+        if ($async.AsyncWaitHandle.WaitOne($timeoutMs, $false) -and $c.Connected) {
+            $c.EndConnect($async) | Out-Null
+            return $addr
+        }
+    } catch { }
+    finally { $c.Close() }
+    return $null
 }
 
-$ipPrinters = $jobs | Receive-Job -Wait -AutoRemoveJob | Where-Object { $_ }
+$pool = [RunspaceFactory]::CreateRunspacePool(1, 64)
+$pool.Open()
+$handles = foreach ($i in 1..254) {
+    $ps = [PowerShell]::Create()
+    $ps.RunspacePool = $pool
+    [void]$ps.AddScript($scriptBlock).AddArgument("$Subnet.$i").AddArgument(9100).AddArgument(400)
+    [pscustomobject]@{ PS = $ps; Async = $ps.BeginInvoke() }
+}
+
+$ipPrinters = foreach ($h in $handles) {
+    try { $result = $h.PS.EndInvoke($h.Async); if ($result) { $result } }
+    finally { $h.PS.Dispose() }
+}
+$pool.Close(); $pool.Dispose()
+$ipPrinters = @($ipPrinters | Where-Object { $_ })
 Write-Host ("  Found {0} IP printer(s): {1}" -f $ipPrinters.Count, ($ipPrinters -join ', ')) -ForegroundColor Green
 
 Write-Host "Enumerating SMB-shared printers via 'net view'..." -ForegroundColor Cyan
